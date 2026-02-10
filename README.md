@@ -41,7 +41,7 @@ Left alone, Copilot will happily create a direct import from your domain layer i
 ### 1. Install via Homebrew
 
 ```bash
-brew tap flavioaiello/domcp https://github.com/flavioaiello/domcp.ai
+brew tap flavioaiello/domcp git@github.com:flavioaiello/domcp.git
 brew install domcp
 ```
 
@@ -255,7 +255,7 @@ This ensures Copilot **proactively** queries the domain model rather than waitin
 ### Homebrew (recommended)
 
 ```bash
-brew tap flavioaiello/domcp https://github.com/flavioaiello/domcp.ai
+brew tap flavioaiello/domcp git@github.com:flavioaiello/domcp.git
 brew install domcp
 ```
 

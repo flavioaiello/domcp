@@ -1,15 +1,15 @@
 class Domcp < Formula
   desc "Domain Model Context Protocol Server — architectural meta-layer for GitHub Copilot"
-  homepage "https://github.com/flavioaiello/domcp.ai"
+  homepage "https://github.com/flavioaiello/domcp"
   license "MIT"
   version "0.1.0"
 
   # Update URL and sha256 when publishing a release
-  # url "https://github.com/flavioaiello/domcp.ai/archive/refs/tags/v#{version}.tar.gz"
+  # url "https://github.com/flavioaiello/domcp/archive/refs/tags/v#{version}.tar.gz"
   # sha256 "REPLACE_WITH_ACTUAL_SHA256"
 
   # For local development / testing:
-  head "https://github.com/flavioaiello/domcp.ai.git", branch: "main"
+  head "https://github.com/flavioaiello/domcp.git", branch: "main"
 
   depends_on "rust" => :build
 
