@@ -1,0 +1,9 @@
+{
+    "servers": {
+        "domcp": {
+            "type": "stdio",
+            "command": "~/.cargo/bin/domcp",
+            "args": ["serve", "--workspace", "${workspaceFolder}"]
+        }
+    }
+}

@@ -1,0 +1,242 @@
+{
+  "name": "MyProject",
+  "description": "Example domain model for a SaaS platform with user management and billing",
+
+  "tech_stack": {
+    "language": "Rust",
+    "framework": "Axum",
+    "database": "PostgreSQL",
+    "messaging": "NATS",
+    "additional": ["Redis", "OpenTelemetry"]
+  },
+
+  "bounded_contexts": [
+    {
+      "name": "Identity",
+      "description": "User identity, authentication, and authorization",
+      "module_path": "src/identity",
+      "entities": [
+        {
+          "name": "User",
+          "description": "Registered user account",
+          "aggregate_root": true,
+          "fields": [
+            { "name": "id", "type": "UserId", "required": true, "description": "Unique user identifier" },
+            { "name": "email", "type": "Email", "required": true, "description": "User email address" },
+            { "name": "display_name", "type": "String", "required": true, "description": "Display name" },
+            { "name": "status", "type": "UserStatus", "required": true, "description": "Account status (active, suspended, deleted)" },
+            { "name": "created_at", "type": "DateTime<Utc>", "required": true, "description": "Account creation timestamp" }
+          ],
+          "methods": [
+            { "name": "register", "description": "Create a new user account", "parameters": [
+              { "name": "email", "type": "Email", "required": true },
+              { "name": "display_name", "type": "String", "required": true }
+            ], "return_type": "Result<User, RegistrationError>" },
+            { "name": "suspend", "description": "Suspend the user account", "parameters": [
+              { "name": "reason", "type": "String", "required": true }
+            ], "return_type": "Result<(), DomainError>" }
+          ],
+          "invariants": [
+            "Email must be unique across all users",
+            "A deleted user cannot be reactivated",
+            "Display name must be between 2 and 100 characters"
+          ]
+        }
+      ],
+      "value_objects": [
+        {
+          "name": "Email",
+          "description": "Validated email address",
+          "fields": [
+            { "name": "value", "type": "String", "required": true }
+          ],
+          "validation_rules": ["Must be a valid email format", "Must be lowercase"]
+        },
+        {
+          "name": "UserId",
+          "description": "Type-safe user identifier",
+          "fields": [
+            { "name": "0", "type": "Uuid", "required": true }
+          ],
+          "validation_rules": ["Must be a valid UUIDv7"]
+        }
+      ],
+      "services": [
+        {
+          "name": "AuthenticationService",
+          "description": "Handles user authentication flows",
+          "kind": "application",
+          "methods": [
+            { "name": "authenticate", "description": "Verify credentials and issue token", "parameters": [
+              { "name": "email", "type": "Email" },
+              { "name": "password", "type": "String" }
+            ], "return_type": "Result<AuthToken, AuthError>" }
+          ],
+          "dependencies": ["UserRepository", "TokenService"]
+        }
+      ],
+      "repositories": [
+        {
+          "name": "UserRepository",
+          "aggregate": "User",
+          "methods": [
+            { "name": "find_by_id", "parameters": [{ "name": "id", "type": "UserId" }], "return_type": "Result<Option<User>>" },
+            { "name": "find_by_email", "parameters": [{ "name": "email", "type": "Email" }], "return_type": "Result<Option<User>>" },
+            { "name": "save", "parameters": [{ "name": "user", "type": "User" }], "return_type": "Result<()>" }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "name": "UserRegistered",
+          "description": "Emitted when a new user registers",
+          "source": "User",
+          "fields": [
+            { "name": "user_id", "type": "UserId", "required": true },
+            { "name": "email", "type": "Email", "required": true },
+            { "name": "registered_at", "type": "DateTime<Utc>", "required": true }
+          ]
+        },
+        {
+          "name": "UserSuspended",
+          "description": "Emitted when a user account is suspended",
+          "source": "User",
+          "fields": [
+            { "name": "user_id", "type": "UserId", "required": true },
+            { "name": "reason", "type": "String", "required": true }
+          ]
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "name": "Billing",
+      "description": "Subscription management, invoicing, and payments",
+      "module_path": "src/billing",
+      "entities": [
+        {
+          "name": "Subscription",
+          "description": "User subscription to a plan",
+          "aggregate_root": true,
+          "fields": [
+            { "name": "id", "type": "SubscriptionId", "required": true },
+            { "name": "user_id", "type": "UserId", "required": true },
+            { "name": "plan", "type": "Plan", "required": true },
+            { "name": "status", "type": "SubscriptionStatus", "required": true },
+            { "name": "current_period_end", "type": "DateTime<Utc>", "required": true }
+          ],
+          "methods": [
+            { "name": "subscribe", "parameters": [
+              { "name": "user_id", "type": "UserId" },
+              { "name": "plan", "type": "Plan" }
+            ], "return_type": "Result<Subscription>" },
+            { "name": "cancel", "parameters": [], "return_type": "Result<()>" },
+            { "name": "renew", "parameters": [], "return_type": "Result<()>" }
+          ],
+          "invariants": [
+            "A user can only have one active subscription at a time",
+            "Cancelled subscriptions remain active until period end"
+          ]
+        },
+        {
+          "name": "Invoice",
+          "description": "Billing invoice for a subscription period",
+          "aggregate_root": false,
+          "fields": [
+            { "name": "id", "type": "InvoiceId", "required": true },
+            { "name": "subscription_id", "type": "SubscriptionId", "required": true },
+            { "name": "amount", "type": "Money", "required": true },
+            { "name": "status", "type": "InvoiceStatus", "required": true }
+          ]
+        }
+      ],
+      "services": [
+        {
+          "name": "PaymentService",
+          "description": "Processes payments through external payment provider",
+          "kind": "infrastructure",
+          "methods": [
+            { "name": "charge", "parameters": [
+              { "name": "invoice", "type": "Invoice" }
+            ], "return_type": "Result<PaymentResult>" }
+          ],
+          "dependencies": ["StripeClient"]
+        }
+      ],
+      "events": [
+        {
+          "name": "SubscriptionCreated",
+          "description": "Emitted when a new subscription is created",
+          "source": "Subscription",
+          "fields": [
+            { "name": "subscription_id", "type": "SubscriptionId", "required": true },
+            { "name": "user_id", "type": "UserId", "required": true },
+            { "name": "plan", "type": "Plan", "required": true }
+          ]
+        }
+      ],
+      "dependencies": ["Identity"]
+    }
+  ],
+
+  "rules": [
+    {
+      "id": "LAYER-001",
+      "description": "Domain layer must not depend on infrastructure or application layers",
+      "severity": "error",
+      "scope": "domain"
+    },
+    {
+      "id": "LAYER-002",
+      "description": "Application services orchestrate domain objects but contain no business logic",
+      "severity": "error",
+      "scope": "application"
+    },
+    {
+      "id": "LAYER-003",
+      "description": "Infrastructure adapters implement repository traits defined in the domain layer",
+      "severity": "error",
+      "scope": "infrastructure"
+    },
+    {
+      "id": "DDD-001",
+      "description": "All state mutations on aggregates must go through aggregate root methods",
+      "severity": "error",
+      "scope": "domain"
+    },
+    {
+      "id": "DDD-002",
+      "description": "Cross-aggregate communication must use domain events, not direct references",
+      "severity": "warning",
+      "scope": "domain"
+    },
+    {
+      "id": "ERR-001",
+      "description": "Use typed domain errors (thiserror), never panic in business logic",
+      "severity": "error",
+      "scope": "all"
+    },
+    {
+      "id": "TEST-001",
+      "description": "Every aggregate root must have unit tests for all invariants",
+      "severity": "warning",
+      "scope": "testing"
+    }
+  ],
+
+  "conventions": {
+    "naming": {
+      "entities": "PascalCase, singular noun (e.g. User, Subscription)",
+      "value_objects": "PascalCase, descriptive noun (e.g. Email, Money, UserId)",
+      "services": "PascalCase + 'Service' suffix (e.g. AuthenticationService)",
+      "repositories": "PascalCase + 'Repository' suffix (e.g. UserRepository)",
+      "events": "PascalCase, past-tense verb + noun (e.g. UserRegistered, SubscriptionCreated)"
+    },
+    "file_structure": {
+      "pattern": "src/{context}/{layer}/{type}.rs",
+      "layers": ["domain", "application", "infrastructure", "api"]
+    },
+    "error_handling": "Use thiserror for domain errors, anyhow for application-level errors. All public functions return Result<T, E>.",
+    "testing": "Unit tests in same file (#[cfg(test)] mod tests). Integration tests in tests/ directory. Use testcontainers for database tests."
+  }
+}

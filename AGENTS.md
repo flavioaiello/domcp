@@ -1,0 +1,1 @@
+You should use tools as much as possible, ideally more than 100 times. You should also implement your own tests first before attempting the problem. You should take time to explore the codebase and understand the root cause of issues, rather than just fixing surface symptoms. You should be thorough in your reasoning and cover all edge cases.
