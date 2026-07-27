@@ -5,22 +5,39 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 pub const DEFAULT_WEB_PORT: u16 = 8888;
 
+/// How long a single connection may take to deliver its request headers and body.
+/// Without this a stalled peer pins a task (and its buffers) indefinitely.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on connections being served at once, so a flood of idle sockets
+/// cannot exhaust memory or task slots.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
 pub async fn run(registry: Arc<CrateRegistry>, preferred_port: u16) -> Result<()> {
     let listener = bind_localhost(preferred_port).await?;
     let addr = listener.local_addr()?;
+    let port = addr.port();
     info!("Axon web graph available at http://{}", addr);
+    let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(permit) = Arc::clone(&limit).acquire_owned().await else {
+            break Ok(());
+        };
         let registry = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, registry).await {
+            let _permit = permit;
+            if let Err(e) = handle_connection(stream, registry, port).await {
                 warn!("web request failed: {e:#}");
             }
         });
@@ -38,29 +55,81 @@ async fn bind_localhost(port: u16) -> Result<TcpListener> {
 pub async fn run_multi(registries: super::WorkspaceRegistries, preferred_port: u16) -> Result<()> {
     let listener = bind_localhost(preferred_port).await?;
     let addr = listener.local_addr()?;
+    let port = addr.port();
     info!(
         "Axon multi-workspace web graph available at http://{}",
         addr
     );
+    let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(permit) = Arc::clone(&limit).acquire_owned().await else {
+            break Ok(());
+        };
         let registries = registries.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection_multi(stream, registries).await {
+            let _permit = permit;
+            if let Err(e) = handle_connection_multi(stream, registries, port).await {
                 warn!("web request failed: {e:#}");
             }
         });
     }
 }
 
+/// Read a request under a deadline, then apply the Host/Origin guard.
+///
+/// Returns `None` when the connection produced nothing or was already answered
+/// with a rejection, so callers can simply stop.
+async fn accept_request(stream: &mut TcpStream, port: u16) -> Result<Option<GuardedRequest>> {
+    let request = match timeout(REQUEST_READ_TIMEOUT, read_http_request(stream)).await {
+        Ok(result) => result?,
+        Err(_) => bail!("HTTP request timed out after {REQUEST_READ_TIMEOUT:?}"),
+    };
+    let Some(request) = request else {
+        return Ok(None);
+    };
+
+    match authorize(&request, port) {
+        Ok(allow_origin) => Ok(Some(GuardedRequest {
+            request,
+            allow_origin,
+        })),
+        Err(reason) => {
+            warn!("{reason}");
+            // Answer without CORS headers: the browser will block the read, and a
+            // non-browser caller still gets a clear status.
+            respond(
+                stream,
+                "403 Forbidden",
+                "text/plain; charset=utf-8",
+                "forbidden",
+                None,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+struct GuardedRequest {
+    request: HttpRequest,
+    allow_origin: Option<String>,
+}
+
 async fn handle_connection_multi(
     mut stream: TcpStream,
     registries: super::WorkspaceRegistries,
+    port: u16,
 ) -> Result<()> {
-    let Some(request) = read_http_request(&mut stream).await? else {
+    let Some(GuardedRequest {
+        request,
+        allow_origin,
+    }) = accept_request(&mut stream, port).await?
+    else {
         return Ok(());
     };
+    let cors = allow_origin.as_deref();
 
     if request.method == "OPTIONS" {
         return respond(
@@ -68,25 +137,34 @@ async fn handle_connection_multi(
             "204 No Content",
             "text/plain; charset=utf-8",
             "",
+            cors,
         )
         .await;
     }
 
     match request.path.as_str() {
         "/mcp" => match request.method.as_str() {
-            "POST" => respond_mcp(&mut stream, &registries, &request.body).await,
+            "POST" => respond_mcp(&mut stream, &registries, &request.body, cors).await,
             _ => {
                 respond(
                     &mut stream,
                     "405 Method Not Allowed",
                     "text/plain; charset=utf-8",
                     "MCP endpoint accepts POST requests",
+                    cors,
                 )
                 .await
             }
         },
         "/" | "/index.html" => {
-            respond(&mut stream, "200 OK", "text/html; charset=utf-8", WEB_HTML).await
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                WEB_HTML,
+                cors,
+            )
+            .await
         }
         "/cytoscape.bundle.js" => {
             respond(
@@ -94,18 +172,19 @@ async fn handle_connection_multi(
                 "200 OK",
                 "application/javascript; charset=utf-8",
                 WEB_CYTOSCAPE,
+                cors,
             )
             .await
         }
         "/api/workspaces" => {
             let map = registries.lock().await;
             let body = serde_json::to_string_pretty(&build_workspace_inventory_json(&map))?;
-            respond(&mut stream, "200 OK", "application/json", &body).await
+            respond(&mut stream, "200 OK", "application/json", &body, cors).await
         }
         "/api/graph" => match select_registry(&registries, &request.query).await {
             Some(registry) => {
                 let body = serde_json::to_string_pretty(&build_graph_json(&registry))?;
-                respond(&mut stream, "200 OK", "application/json", &body).await
+                respond(&mut stream, "200 OK", "application/json", &body, cors).await
             }
             None => {
                 respond(
@@ -113,6 +192,7 @@ async fn handle_connection_multi(
                     "200 OK",
                     "application/json",
                     r#"{"crates":[],"nodes":[],"edges":[]}"#,
+                    cors,
                 )
                 .await
             }
@@ -120,9 +200,9 @@ async fn handle_connection_multi(
         "/api/health" => match select_registry(&registries, &request.query).await {
             Some(registry) => {
                 let body = serde_json::to_string_pretty(&build_health_json(&registry))?;
-                respond(&mut stream, "200 OK", "application/json", &body).await
+                respond(&mut stream, "200 OK", "application/json", &body, cors).await
             }
-            None => respond(&mut stream, "200 OK", "application/json", "{}").await,
+            None => respond(&mut stream, "200 OK", "application/json", "{}", cors).await,
         },
         _ => {
             respond(
@@ -130,6 +210,7 @@ async fn handle_connection_multi(
                 "404 Not Found",
                 "text/plain; charset=utf-8",
                 "not found",
+                cors,
             )
             .await
         }
@@ -140,10 +221,20 @@ async fn respond_mcp(
     stream: &mut TcpStream,
     registries: &super::WorkspaceRegistries,
     body: &str,
+    allow_origin: Option<&str>,
 ) -> Result<()> {
     match build_mcp_http_response(registries, body).await? {
-        Some(body) => respond(stream, "200 OK", "application/json", &body).await,
-        None => respond(stream, "202 Accepted", "text/plain; charset=utf-8", "").await,
+        Some(body) => respond(stream, "200 OK", "application/json", &body, allow_origin).await,
+        None => {
+            respond(
+                stream,
+                "202 Accepted",
+                "text/plain; charset=utf-8",
+                "",
+                allow_origin,
+            )
+            .await
+        }
     }
 }
 
@@ -281,10 +372,19 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) -> Result<()> {
-    let Some(request) = read_http_request(&mut stream).await? else {
+async fn handle_connection(
+    mut stream: TcpStream,
+    registry: Arc<CrateRegistry>,
+    port: u16,
+) -> Result<()> {
+    let Some(GuardedRequest {
+        request,
+        allow_origin,
+    }) = accept_request(&mut stream, port).await?
+    else {
         return Ok(());
     };
+    let cors = allow_origin.as_deref();
 
     if request.method == "OPTIONS" {
         return respond(
@@ -292,13 +392,21 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) 
             "204 No Content",
             "text/plain; charset=utf-8",
             "",
+            cors,
         )
         .await;
     }
 
     match request.path.as_str() {
         "/" | "/index.html" => {
-            respond(&mut stream, "200 OK", "text/html; charset=utf-8", WEB_HTML).await
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                WEB_HTML,
+                cors,
+            )
+            .await
         }
         "/cytoscape.bundle.js" => {
             respond(
@@ -306,16 +414,17 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) 
                 "200 OK",
                 "application/javascript; charset=utf-8",
                 WEB_CYTOSCAPE,
+                cors,
             )
             .await
         }
         "/api/graph" => {
             let body = serde_json::to_string_pretty(&build_graph_json(&registry))?;
-            respond(&mut stream, "200 OK", "application/json", &body).await
+            respond(&mut stream, "200 OK", "application/json", &body, cors).await
         }
         "/api/health" => {
             let body = serde_json::to_string_pretty(&build_health_json(&registry))?;
-            respond(&mut stream, "200 OK", "application/json", &body).await
+            respond(&mut stream, "200 OK", "application/json", &body, cors).await
         }
         _ => {
             respond(
@@ -323,6 +432,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<CrateRegistry>) 
                 "404 Not Found",
                 "text/plain; charset=utf-8",
                 "not found",
+                cors,
             )
             .await
         }
@@ -334,6 +444,76 @@ struct HttpRequest {
     path: String,
     query: String,
     body: String,
+    origin: Option<String>,
+    host: Option<String>,
+}
+
+/// Loopback host names the daemon will answer for.
+///
+/// Anything else in a `Host` header means the request was routed to us through a
+/// name we do not own (DNS rebinding), so it is refused.
+const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "[::1]", "::1"];
+
+/// Decide whether a request may be served, and which `Origin` (if any) to echo.
+///
+/// * `Host` must name a loopback address on our own port. This blocks DNS
+///   rebinding, where a public name resolves to 127.0.0.1 to reach us.
+/// * `Origin` is only present on browser-issued requests. When present it must be
+///   this exact server's origin, so a page on any other site — including
+///   `file://`, which sends `Origin: null` — cannot read our responses.
+/// * A missing `Origin` is a non-browser client (MCP host, curl); allowed, and
+///   nothing is echoed.
+fn authorize(request: &HttpRequest, port: u16) -> std::result::Result<Option<String>, String> {
+    if let Some(host) = &request.host
+        && !host_is_local(host, port)
+    {
+        return Err(format!("refusing request for non-loopback Host '{host}'"));
+    }
+
+    match &request.origin {
+        None => Ok(None),
+        Some(origin) if origin_is_local(origin, port) => Ok(Some(origin.clone())),
+        Some(origin) => Err(format!("refusing cross-origin request from '{origin}'")),
+    }
+}
+
+fn host_is_local(host: &str, port: u16) -> bool {
+    let host = host.trim();
+    let (name, host_port) = split_host_port(host);
+    match host_port {
+        Some(host_port) => host_port == port && LOOPBACK_HOSTS.contains(&name),
+        // No port means the default 80; only correct if that is what we bound.
+        None => port == 80 && LOOPBACK_HOSTS.contains(&name),
+    }
+}
+
+fn origin_is_local(origin: &str, port: u16) -> bool {
+    let Some(authority) = origin.trim().strip_prefix("http://") else {
+        // Includes `null` (file:// / sandboxed frames) and any https origin,
+        // neither of which this server can legitimately have served.
+        return false;
+    };
+    let (name, origin_port) = split_host_port(authority);
+    origin_port == Some(port) && LOOPBACK_HOSTS.contains(&name)
+}
+
+/// Split an authority into host and port, keeping bracketed IPv6 literals intact.
+fn split_host_port(authority: &str) -> (&str, Option<u16>) {
+    // IPv6 literals are bracketed (`[::1]:8888`), so the port separator is the
+    // first `:` after the closing bracket, not the last `:` in the string.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((name, tail)) = rest.split_once(']') else {
+            return (authority, None);
+        };
+        return (name, tail.strip_prefix(':').and_then(|p| p.parse().ok()));
+    }
+    match authority.rsplit_once(':') {
+        Some((name, port)) => match port.parse() {
+            Ok(port) => (name, Some(port)),
+            Err(_) => (authority, None),
+        },
+        None => (authority, None),
+    }
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
@@ -364,10 +544,20 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>
     let method = request_parts.next().unwrap_or("GET").to_string();
     let target = request_parts.next().unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let content_length = lines
-        .filter_map(content_length_header)
-        .next()
-        .unwrap_or_default();
+
+    let header_lines: Vec<&str> = lines.collect();
+    // Conflicting Content-Length headers are a request-smuggling primitive; the
+    // only safe response is to refuse rather than pick one.
+    let lengths: Vec<usize> = header_lines
+        .iter()
+        .filter_map(|line| content_length_header(line))
+        .collect();
+    if lengths.windows(2).any(|pair| pair[0] != pair[1]) {
+        bail!("HTTP request carried conflicting Content-Length headers");
+    }
+    let content_length = lengths.first().copied().unwrap_or_default();
+    let origin = header_value(&header_lines, "origin");
+    let host = header_value(&header_lines, "host");
 
     while buffer.len() < header_end + content_length {
         let read = stream.read(&mut chunk).await?;
@@ -388,7 +578,18 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>
         path: path.to_string(),
         query: query.to_string(),
         body,
+        origin,
+        host,
     }))
+}
+
+fn header_value(lines: &[&str], name: &str) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
@@ -411,14 +612,31 @@ fn content_length_header(line: &str) -> Option<usize> {
         .flatten()
 }
 
+/// Build the CORS header block for a response.
+///
+/// Only ever called with an origin `authorize` already accepted, so echoing it
+/// cannot widen access. When no origin was allowed the block is empty — notably
+/// never `*`, which would hand every site on the internet read access to a
+/// loopback service.
+fn cors_headers(allow_origin: Option<&str>) -> String {
+    match allow_origin {
+        Some(origin) => format!(
+            "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, Mcp-Session-Id\r\nAccess-Control-Expose-Headers: MCP-Protocol-Version, Mcp-Session-Id\r\n"
+        ),
+        None => String::new(),
+    }
+}
+
 async fn respond(
     stream: &mut TcpStream,
     status: &str,
     content_type: &str,
     body: &str,
+    allow_origin: Option<&str>,
 ) -> Result<()> {
+    let cors = cors_headers(allow_origin);
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, Mcp-Session-Id\r\nAccess-Control-Expose-Headers: MCP-Protocol-Version, Mcp-Session-Id\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{cors}Connection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -1193,6 +1411,86 @@ mod tests {
     use std::env::temp_dir;
     use std::fs;
     use tokio::sync::Mutex;
+
+    fn request_with(origin: Option<&str>, host: Option<&str>) -> HttpRequest {
+        HttpRequest {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            query: String::new(),
+            body: String::new(),
+            origin: origin.map(str::to_string),
+            host: host.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn authorize_allows_own_loopback_origins() {
+        for origin in [
+            "http://127.0.0.1:8888",
+            "http://localhost:8888",
+            "http://[::1]:8888",
+        ] {
+            let request = request_with(Some(origin), Some("127.0.0.1:8888"));
+            assert_eq!(
+                authorize(&request, 8888).unwrap(),
+                Some(origin.to_string()),
+                "{origin} should be allowed and echoed verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn authorize_rejects_foreign_and_spoofed_origins() {
+        for origin in [
+            "http://evil.example",
+            "null",
+            "https://127.0.0.1:8888",
+            // Right name, wrong port: a different local server, not us.
+            "http://127.0.0.1:9999",
+            // Suffix/prefix tricks that a naive `contains` check would accept.
+            "http://127.0.0.1.evil.example:8888",
+            "http://localhost.evil.example:8888",
+        ] {
+            let request = request_with(Some(origin), Some("127.0.0.1:8888"));
+            assert!(
+                authorize(&request, 8888).is_err(),
+                "{origin} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn authorize_allows_absent_origin_without_echoing_cors() {
+        // Non-browser clients (MCP hosts, curl) send no Origin.
+        let request = request_with(None, Some("127.0.0.1:8888"));
+        assert_eq!(authorize(&request, 8888).unwrap(), None);
+    }
+
+    #[test]
+    fn authorize_rejects_rebound_host() {
+        // DNS rebinding: attacker name resolves to 127.0.0.1, so the connection
+        // reaches us, but the Host header still carries their domain.
+        let request = request_with(None, Some("evil.example:8888"));
+        assert!(authorize(&request, 8888).is_err());
+    }
+
+    #[test]
+    fn cors_headers_never_emit_a_wildcard() {
+        let allowed = cors_headers(Some("http://127.0.0.1:8888"));
+        assert!(allowed.contains("Access-Control-Allow-Origin: http://127.0.0.1:8888\r\n"));
+        assert!(allowed.contains("Vary: Origin\r\n"));
+        assert!(!allowed.contains('*'));
+
+        // No allowed origin means no CORS block at all, so a browser blocks the read.
+        assert_eq!(cors_headers(None), "");
+    }
+
+    #[test]
+    fn split_host_port_handles_ipv6_literals() {
+        assert_eq!(split_host_port("[::1]:8888"), ("::1", Some(8888)));
+        assert_eq!(split_host_port("127.0.0.1:8888"), ("127.0.0.1", Some(8888)));
+        assert_eq!(split_host_port("localhost"), ("localhost", None));
+    }
 
     #[test]
     fn graph_json_contains_actual_model_nodes() {

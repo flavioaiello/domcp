@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 // ─── JSON-RPC Envelope ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcRequest {
     #[serde(rename = "jsonrpc")]
     pub _jsonrpc: String,

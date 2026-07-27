@@ -1427,9 +1427,6 @@ impl Store {
             )?;
 
             for dep in &bc.dependencies {
-                if same_context_name(&bc.name, dep) {
-                    continue;
-                }
                 self.run_script(
                     "?[workspace, from_ctx, to_ctx, state] <- [[$ws, $from, $to, $st]] :put context_dep { workspace, from_ctx, to_ctx, state }",
                     params_map(&[("ws", workspace), ("from", &bc.name), ("to", dep), ("st", state)]),
@@ -2951,9 +2948,6 @@ impl Store {
             format!("retract context dependencies for {name}"),
         )?;
         for dep in dependencies {
-            if same_context_name(name, dep) {
-                continue;
-            }
             self.run_script(
                 "?[workspace, from_ctx, to_ctx, state] <- [[$ws, $from, $to, 'actual']] :put context_dep { workspace, from_ctx, to_ctx, state }",
                 params_map(&[("ws", &ws), ("from", name), ("to", dep)]),
@@ -9111,10 +9105,16 @@ fn rust_fact_allowed(
     requested.allows(rust_fact_scope(file_path, symbol, marker))
 }
 
+/// True when both names denote the same bounded context, i.e. the edge is a self-loop.
+///
+/// This is a *presentation* predicate used to suppress self-edges in graph views
+/// and edge counts; the underlying `context_dep` facts always retain self-loops so
+/// cycle detection can still observe them. Comparison is case-sensitive: `Billing`
+/// and `billing` are distinct contexts, not a self-loop.
 fn same_context_name(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
-    !left.is_empty() && left.eq_ignore_ascii_case(right)
+    !left.is_empty() && left == right
 }
 
 fn is_test_fact(file_path: &str, symbol: &str, marker: &str) -> bool {
@@ -9468,11 +9468,11 @@ fn module_components_without(
                     if removed_node == Some(next.as_str()) {
                         continue;
                     }
-                    if let Some((left, right)) = removed_edge {
-                        if (current == left && next == right) || (current == right && next == left)
-                        {
-                            continue;
-                        }
+                    if let Some((left, right)) = removed_edge
+                        && ((current == left && next == right)
+                            || (current == right && next == left))
+                    {
+                        continue;
                     }
                     if !visited.contains(next) {
                         queue.push_back(next.clone());
@@ -9512,10 +9512,19 @@ fn module_articulation_separators(
     separators
 }
 
+/// A module dependency edge, as an ordered `(from, to)` module-path pair.
+type ModuleEdge = (String, String);
+
+/// Connected components of the module graph, each a sorted list of module paths.
+type ModuleComponents = Vec<Vec<String>>;
+
+/// A bridge edge whose removal disconnects the module graph, with the resulting components.
+type ModuleBridgeSeparator = (ModuleEdge, ModuleComponents);
+
 fn module_bridge_separators(
     nodes: &BTreeSet<String>,
-    edges: &BTreeSet<(String, String)>,
-) -> Vec<((String, String), Vec<Vec<String>>)> {
+    edges: &BTreeSet<ModuleEdge>,
+) -> Vec<ModuleBridgeSeparator> {
     let adjacency = undirected_module_adjacency(nodes, edges);
     let baseline = module_components_without(&adjacency, None, None).len();
     let mut undirected_edges = BTreeSet::new();

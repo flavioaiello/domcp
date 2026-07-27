@@ -102,8 +102,8 @@ pub(crate) fn handle_global_request(req: &JsonRpcRequest) -> Option<JsonRpcRespo
 
 pub(crate) fn parse_tool_call_params(
     req: &JsonRpcRequest,
-) -> std::result::Result<ToolCallParams, JsonRpcResponse> {
-    parse_params(req).map_err(|response| *response)
+) -> std::result::Result<ToolCallParams, Box<JsonRpcResponse>> {
+    parse_params(req)
 }
 
 fn select_tool_entry<'a>(

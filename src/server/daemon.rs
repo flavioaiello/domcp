@@ -130,7 +130,7 @@ pub(super) async fn handle_daemon_request(
     let workspace = if request.method == "tools/call" {
         let params = match parse_tool_call_params(request) {
             Ok(params) => params,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         match workspace_for_tool_call(&params.arguments, default_workspace) {
             Ok(workspace) => workspace,
@@ -162,7 +162,22 @@ pub(super) async fn handle_daemon_request(
             );
         }
     };
-    handle_request_with_registry(&registry, request)
+    // Tool dispatch is fully synchronous and can be very slow: `rust_scan` runs a
+    // whole rust-analyzer workspace load, which shells out to cargo. Running that
+    // inline would pin a runtime worker for the duration and stall every other
+    // client sharing this daemon, so it goes to the blocking pool.
+    let request = request.clone();
+    let request_id = request.id.clone();
+    match tokio::task::spawn_blocking(move || handle_request_with_registry(&registry, &request))
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => JsonRpcResponse::error(
+            request_id,
+            -32000,
+            format!("Tool execution failed: {error}"),
+        ),
+    }
 }
 
 fn workspace_for_tool_call(
@@ -260,26 +275,57 @@ fn canonicalize_or_self(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Ceiling on simultaneously registered workspaces.
+///
+/// Each registration permanently costs a CozoDB store per crate plus a recursive
+/// filesystem watcher, and nothing is ever released: the watcher task holds its
+/// own `Arc<CrateRegistry>`, so dropping the map entry would neither free the
+/// store nor stop the watch. Until watcher shutdown exists, a hard ceiling is the
+/// honest bound — it caps the cost instead of pretending to reclaim it.
+const MAX_REGISTERED_WORKSPACES: usize = 32;
+
 /// Return the registry for `workspace`, building, scanning, and starting a
 /// watcher for it on first use. Keyed by canonical path so symlinked or relative
 /// variants resolve to the same in-memory model.
 async fn ensure_registry(registries: &Registries, workspace: &str) -> Result<Arc<CrateRegistry>> {
     let key = canonicalize_path(workspace);
+    {
+        let map = registries.lock().await;
+        if let Some(existing) = map.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        anyhow::ensure!(
+            map.len() < MAX_REGISTERED_WORKSPACES,
+            "daemon is already tracking {MAX_REGISTERED_WORKSPACES} workspaces; \
+             restart the daemon to register a different one"
+        );
+    }
+
+    // Build outside the map lock: `CrateRegistry::open` walks the tree and opens a
+    // CozoDB per crate, and holding the lock across that would serialize every
+    // other workspace's requests behind one cold registration.
+    let open_key = key.clone();
+    let registry = tokio::task::spawn_blocking(move || {
+        CrateRegistry::open(Path::new(&open_key))
+            .with_context(|| format!("open workspace {open_key}"))
+    })
+    .await
+    .context("workspace registration task panicked")??;
+    let registry = Arc::new(registry);
+
+    // Two callers can race here; the first insert wins so every caller shares one
+    // registry (and only one watcher is ever started for it).
     let mut map = registries.lock().await;
     if let Some(existing) = map.get(&key) {
         return Ok(Arc::clone(existing));
     }
-
-    let registry = Arc::new(
-        CrateRegistry::open(Path::new(&key)).with_context(|| format!("open workspace {key}"))?,
-    );
     info!(
         "daemon registered workspace {} ({} crate(s))",
         key,
         registry.crates().len()
     );
-
     map.insert(key.clone(), Arc::clone(&registry));
+    drop(map);
 
     // Keep this workspace's model fresh without blocking MCP startup. The
     // initial scan can take long enough for clients to time out while waiting
